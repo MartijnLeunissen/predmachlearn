@@ -1,0 +1,192 @@
+---
+title: "Predicting Weight Lifting Exercise Scenario"
+author: "Martijn Leunissen"
+date: "25 October 2015"
+output: html_document
+---
+
+#Summary##
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement. A group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks.
+
+One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this data set, the participants were asked to perform barbell lifts correctly and incorrectly in 5 different ways. For more info see [1].
+
+In this document we will use the data from these sensors to predict the manner in which a participant performed the exercise based on sensor data. 
+
+#Setup 
+##General Setup
+```{r}
+#Load libraries and set up random seed
+library(randomForest)
+library(caret)
+library(parallel)
+library(doMC)
+registerDoMC(cores = 8)
+set.seed(42*37)
+```
+
+##Obtain Data Set
+```{r}
+# Get input files if not available in current working set
+training.filename <- './training.csv'
+testing.filename <- './testing.csv'
+training.url <-'http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv'
+testing.url <- 'http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv'
+if (!file.exists(training.filename)) {
+    download.file(
+      training.url,
+      destfile = training.filename
+    )
+}
+if (! file.exists(testing.filename)) {
+    download.file(
+      testing.url,
+      destfile = testing.filename
+    )
+}
+
+training.raw <- read.csv(training.filename, dec=".", na.strings=c("NA",""), strip.white=T)
+testing.raw <- read.csv(testing.filename, dec=".", na.strings=c("NA",""), strip.white=T)
+training.raw$nuser_name <- as.factor(training.raw$user_name)
+testing.raw$nuser_name <- as.factor(testing.raw$user_name)
+
+```
+
+#Data Set Exploration
+
+Based on the summary of the data (see appendix I) we see that there are a few columns that contain only experimental setup values. Furthermore there are a lot of columns that contain mainly NA values. To obtain a good set of predictors for the model I choose to:
+
+- Remove the experimental setup values
+- Remove columns that have a high number of NA's
+
+Furthermore, after cleaning the data set using the steps above we will:
+
+- Remove columns that have near zero variance
+- Remove correlated columns
+
+```{r}
+columnConditionFraction <- function(data, condition, fraction){
+  res <- apply(data, 2, function(x) { length(which(condition(x)))/length(x) })
+  return(res)
+}
+columnNamesConditionFraction <- function(data, condition, fraction){
+  counts <- apply(data, 2, function(x) { length(which(condition(x)))/length(x) })
+  res <- colnames(data)[counts >= fraction]
+  return(res)
+}
+
+columnNumbersConditionFraction <- function(data, condition, fraction){
+  res <- which(colnames(data) %in% columnNamesConditionFraction(data, condition, fraction))
+  return(res)
+}
+
+#Remove Columns that belong to the experimental setup
+experimental.setup.columns <- which(colnames(training.raw) %in% c('X', 'raw_timestamp_part_1', 'raw_timestamp_part_2', 'cvtd_timestamp', 'new_window', 'num_window'))
+training.noexp <- training.raw[ ,-experimental.setup.columns]
+
+#Remove Columns that consists for more then 5% out of NA values
+training.nona <- training.noexp[ ,-columnNumbersConditionFraction(training.noexp, is.na,0.05)]
+
+#Remove Columns that have near zero variation
+training.nearZeroVar <- nearZeroVar(training.nona[sapply(training.nona, is.numeric)],saveMetrics=T)
+training.noZeroVar <-  training.nona[,training.nearZeroVar[, 'nzv']==F]
+
+#Look into correlation using correlation matrix an plot
+training.correlationMatrix <- cor(na.omit(training.noZeroVar[sapply(training.noZeroVar, is.numeric)]))
+training.correlationDF <- expand.grid(
+  row=1:dim(training.correlationMatrix)[1], 
+  col=1:dim(training.correlationMatrix)[2]
+)
+
+#alternative plot
+#training.correlationDF$correlation <- as.vector(training.correlationMatrix)
+#levelplot(correlation ~ row+ col, training.correlationDF)
+
+corPalette <- colorRampPalette(c("red", "white", "blue"))(n=1024)
+heatmap(training.correlationMatrix, col = corPalette )
+
+#Remove Columns with higher than abs 0.9 correlation
+training.correlation <- findCorrelation(training.correlationMatrix, cutoff = .9, verbose = TRUE)
+training.clean <- training.noZeroVar[,-training.correlation]
+```
+
+
+#Data Slicing
+Split Original Training set in a model training and model testing set
+```{r}
+inTrain <- createDataPartition(training.clean$classe, p=0.7, list=F)
+model.training <- training.clean[inTrain,]
+model.testing <- training.clean[-inTrain,]
+```
+
+#Model
+
+In my initial attempt to build a predictive model I chose to use the random forest algorithm.
+
+Random forests have some advantegeous properties that make them a good choice for this high-dimensional classification problem where the number of observations available far exceeds the number of predictors. 
+
+- No parameter selection is involved. 
+- Good in-training measure of variable importance
+- Out of bag error can be used as estimate for generalization error
+
+```{r}
+#Train on cleaned dataset using random forest
+ctrl <- trainControl(allowParallel=T, method="repeatedcv", number=3, repeats=2)
+#ctrl <- trainControl(allowParallel=T, method="repeatedcv", number=2, repeats=1)
+model <- train(classe ~ ., data=model.training, model="rf", trControl=ctrl)
+pred <- predict(model, newdata=model.testing)
+```
+
+##Resulting variable importance as indicated by the model
+
+```{r}
+varImp(model)
+varImpPlot(model$finalModel, main="RF Model Variable Importance")
+?varImpPlot
+```
+
+##Model Validation#
+
+We use the test set part of the training set to cross-validate the results:
+```{r}
+#The accuraracy of the model is:
+accuracy <- sum(pred == model.testing$classe) / length(pred)
+accuracy
+```
+
+
+Confusion Matrix and Out of Sample Error:
+```{r}
+confusionMatrix <- confusionMatrix(model.testing$classe, pred)$table
+confusionMatrix
+outOfSampleError <- 1-sum(diag(confusionMatrix))/sum(as.vector(confusionMatrix))
+outOfSampleError
+```
+
+#Results
+
+Apply model to real testing set to obtain final answers
+```{r}
+#Clean testing set similar to trianing set
+testing.clean <- testing.raw[,which(colnames(testing.raw) %in% names(training.clean))]
+#Apply model
+answers <- predict(model, newdata=testing.clean)
+answers
+```
+
+Based on the feedback from the test all of these answers are correct, so the model reached a 100% correct result rate. 
+
+#Conclusion
+
+The model obtained using the initial approach has a low out of sample error. It also performed perfectly on the testing set provided. Further exploration of an alternative model does not seem neccessary. Using the Random Forests method we can create a high quality predictive model for the data set provided.
+
+#References
+
+[1] Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013. http://groupware.les.inf.puc-rio.br/har#ixzz3pYy3drkP
+
+#Appendix I
+
+
+```{r}
+summary(training.raw)
+```
